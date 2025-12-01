@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 import gymnasium as gym
 from gymnasium.wrappers import FlattenObservation
+import gymnasium_robotics
 
 from stable_baselines3 import PPO
 
@@ -23,6 +24,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+import imageio
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -30,7 +32,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ===========================
 # 0. 설정
 # ===========================
-ENV_ID = "FetchReach-v2"  # 설치 버전에 따라 v1/v3일 수도 있음
+ENV_ID = "FetchReach-v4"  # 설치 버전에 따라 v1/v3일 수도 있음
 EXPERT_MODEL_PATH = "ppo_fetchreach_expert"
 DATASET_PATH = "fetchreach_expert_dataset.npz"
 DIFFUSION_MODEL_PATH = "diffusion_fetchreach_policy.pt"
@@ -41,13 +43,14 @@ COLLECT_DATA = True
 TRAIN_DIFFUSION = True
 EVAL_DIFFUSION = True
 
+print([id for id in gym.envs.registry.keys() if "FetchReach" in id])
 # In MuJoCo 세계: 로봇팔을 MJCF 파일(XML)로 “설계하고” 그걸 엔진이 읽어서 가상의 로봇팔을 만들어줌
 
-def make_env(): # 로봇 팔을 책상 위에 가져다 놓고 전원을 넣는 것
+def make_env(render_mode): # 로봇 팔을 책상 위에 가져다 놓고 전원을 넣는 것
     """
     FetchReach-v2 환경을 만들고, observation dict를 1D 벡터로 flatten.
     """
-    env = gym.make(ENV_ID) # 로봇 시뮬레이터, MJCF 파일 (MuJoCo의 로봇/환경 정의 파일) 불러오고, 물리 엔진 초기화하고, reward function 세팅하고, action space / observation space 세팅하고
+    env = gym.make(ENV_ID,reward_type="dense", render_mode=render_mode) # 로봇 시뮬레이터, MJCF 파일 (MuJoCo의 로봇/환경 정의 파일) 불러오고, 물리 엔진 초기화하고, reward function 세팅하고, action space / observation space 세팅하고
     
     # MJCF includes 로봇 base 위치, 관절(joint) 종류: revolute, prismatic 등, 각 링크(link) 크기/질량/관성, 손(gripper)의 finger geometry, collision shape, actuator (torque/force control) 설정, 카메라 위치, 목표(goal) object 위치
     
@@ -57,21 +60,61 @@ def make_env(): # 로봇 팔을 책상 위에 가져다 놓고 전원을 넣는 
     # "achieved_goal": [current_x, current_y, current_z]  # 현재 end-effector 좌표 (ex. length 3)
     # } => FlattenObservation => obs_flat = [...16 numbers]
     env = FlattenObservation(env)  # dict(obs, desired_goal, achieved_goal) -> flat vector
+
+    # viewer 생성 (첫 render에서 만들어짐)
+    if render_mode in ("rgb_array", "human"):
+
+        env.reset()
+        env.render()  # viewer 초기화
+
+        viewer = env.unwrapped.mujoco_renderer.viewer
+
+        # ===== 여기서 카메라 세팅 =====
+        viewer.cam.lookat[:] = [2.1, -1.7, 0.1]
+        viewer.cam.distance  = 4.3
+        viewer.cam.elevation = -30
+        viewer.cam.azimuth   = 220
+        # =============================
+
     return env
 
 
 # ===========================
 # 1. Expert (PPO) 학습 + 데이터 수집
 # ===========================
-def train_expert(total_timesteps: int = 300_000):
-    """
-    PPO로 FetchReach expert 정책 학습.
-    """
-    env = make_env()
-    # 관측(obs) 입력 → 행동(action) 출력하는 MLP
-    # 이 로봇 환경을 보고 행동을 결정하는 뇌(MlpPolicy)를 PPO 알고리즘으로 학습시키겠다. 
-    model = PPO("MlpPolicy", env, verbose=1)
-    model.learn(total_timesteps=total_timesteps) # Generate one option trajectory for goal
+def train_expert(total_timesteps: int = 2_000_000, tuning: bool = True):
+    env = make_env(render_mode=None)
+
+    policy_kwargs = dict(
+        net_arch=[256, 256],   # 🔧 policy/value 둘 다 256-256
+    )
+
+    if tuning and os.path.exists(EXPERT_MODEL_PATH + ".zip"):
+        print(f"🔄 기존 Expert 로드해서 이어서 학습: {EXPERT_MODEL_PATH}.zip")
+        model = PPO.load(EXPERT_MODEL_PATH, env=env)
+        model.set_env(env)
+        model.learn(
+            total_timesteps=total_timesteps,
+            reset_num_timesteps=False,   # 이어서
+        )
+    else:
+        print("🆕 새 Expert 모델 생성해서 처음부터 학습")
+        model = PPO(
+            "MlpPolicy",
+            env,
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=256,
+            gamma=0.98,          # FetchReach에서는 0.98 정도도 잘 작동함
+            gae_lambda=0.95,
+            ent_coef=0.0,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            policy_kwargs=policy_kwargs,
+            verbose=1,
+        )
+        model.learn(total_timesteps=total_timesteps)
+
     model.save(EXPERT_MODEL_PATH)
     print(f"✅ Expert model saved to: {EXPERT_MODEL_PATH}.zip")
 
@@ -92,7 +135,7 @@ def collect_expert_data(
     assert os.path.exists(EXPERT_MODEL_PATH + ".zip"), \
         "Expert model not found. 먼저 train_expert()를 실행하세요."
 
-    env = make_env()
+    env = make_env(render_mode=None)
     model = PPO.load(EXPERT_MODEL_PATH, env=env) # Example
 
     observations = []
@@ -252,7 +295,7 @@ class ActionDiffusion:
 
         return sqrt_alpha_bar_t * x0 + sqrt_one_minus_alpha_bar_t * noise
 
-    def p_sample(self, model: DiffusionPolicy, x_t, t, obs):
+    def p_sample(self, model: DiffusionPolicy, x_t, t, obs, add_noise: bool = True):
         """
         하나의 reverse step: p_theta(x_{t-1} | x_t)
         """
@@ -266,12 +309,13 @@ class ActionDiffusion:
         # DDPM 공식: x_{t-1} = 1/sqrt(alpha_t) * (x_t - (1-alpha_t)/sqrt(1 - alpha_bar_t) * eps_theta) + sigma_t z
         coef = beta_t / sqrt_one_minus_alpha_bar_t
         mean = sqrt_recip_alpha_t * (x_t - coef * eps_theta)
+        if add_noise and (t[0] > 0):  # t>0일 때만 noise (혹은 아예 제거)
+            noise = torch.randn_like(x_t)
+            sigma_t = torch.sqrt(beta_t)
+            x_prev = mean + sigma_t * noise
+        else:
+            x_prev = mean
 
-        # t > 0 인 경우에만 noise 추가
-        noise = torch.randn_like(x_t)
-        # "posterior variance" 단순화해서 beta_t 사용
-        sigma_t = torch.sqrt(beta_t)
-        x_prev = mean + sigma_t * noise
         return x_prev
 
     def p_sample_loop(self, model: DiffusionPolicy, obs, n_samples=1):
@@ -293,7 +337,7 @@ class ActionDiffusion:
 
             for t_inv in range(self.cfg.timesteps - 1, -1, -1):
                 t = torch.full((B,), t_inv, device=device, dtype=torch.long)
-                x_t = self.p_sample(model, x_t, t, obs_batch)
+                x_t = self.p_sample(model, x_t, t, obs_batch, add_noise=False)
 
             return x_t.cpu().numpy()  # (B, action_dim)
 
@@ -305,52 +349,59 @@ def train_diffusion_policy(
     batch_size: int = 256,
     epochs: int = 20,
     lr: float = 1e-4,
+    resume: bool = True,   # ← 추가
 ):
     dataset = FetchReachExpertDataset(DATASET_PATH)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
-    obs_dim = dataset.obs.shape[1]
-    act_dim = dataset.actions.shape[1]
+    # ---- 모델 / cfg 로드 또는 새로 생성 ----
+    if resume and os.path.exists(DIFFUSION_MODEL_PATH):
+        print(f"🔄 기존 diffusion policy 로드해서 이어서 학습: {DIFFUSION_MODEL_PATH}")
+        checkpoint = torch.load(DIFFUSION_MODEL_PATH, map_location=device)
+        cfg_dict = checkpoint["cfg"]
+        cfg = DiffusionConfig(**cfg_dict)
+        model = DiffusionPolicy(cfg).to(device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        diffusion = ActionDiffusion(cfg)
+        start_epoch = checkpoint.get("epoch", 0) + 1
+    else:
+        print("🆕 새 diffusion policy를 처음부터 학습")
+        obs_dim = dataset.obs.shape[1]
+        act_dim = dataset.actions.shape[1]
 
-    cfg = DiffusionConfig(
-        action_dim=act_dim,
-        obs_dim=obs_dim,
-        timesteps=100,
-        beta_start=1e-4,
-        beta_end=0.02,
-        hidden_dim=256,
-    )
-
-    diffusion = ActionDiffusion(cfg)
-    model = DiffusionPolicy(cfg).to(device)
+        cfg = DiffusionConfig(
+            action_dim=act_dim,
+            obs_dim=obs_dim,
+            timesteps=100,
+            beta_start=1e-4,
+            beta_end=0.02,
+            hidden_dim=256,
+        )
+        diffusion = ActionDiffusion(cfg)
+        model = DiffusionPolicy(cfg).to(device)
+        start_epoch = 1
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     mse = nn.MSELoss()
 
     model.train()
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, start_epoch + epochs):
         total_loss = 0.0
         total_samples = 0
 
-        pbar = tqdm(dataloader, desc=f"[Diffusion Train] Epoch {epoch}/{epochs}")
+        pbar = tqdm(dataloader, desc=f"[Diffusion Train] Epoch {epoch}")
         for obs_batch, act_batch in pbar:
             obs_batch = obs_batch.to(device)
             act_batch = act_batch.to(device)
 
             B = obs_batch.size(0)
-            # x0 = expert action
             x0 = act_batch
 
-            # 랜덤 timestep 샘플링
             t = torch.randint(0, cfg.timesteps, (B,), device=device).long()
             noise = torch.randn_like(x0)
 
-            # forward q(x_t | x0)
             x_t = diffusion.q_sample(x0, t, noise=noise)
-
-            # 모델이 noise 예측
             eps_hat = model(x_t, t, obs_batch)
-
             loss = mse(eps_hat, noise)
 
             optimizer.zero_grad()
@@ -359,21 +410,22 @@ def train_diffusion_policy(
 
             total_loss += loss.item() * B
             total_samples += B
-
             pbar.set_postfix(loss=loss.item())
 
         avg_loss = total_loss / total_samples
         print(f"[Epoch {epoch}] avg loss: {avg_loss:.6f}")
 
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "cfg": cfg.__dict__,
-        },
-        DIFFUSION_MODEL_PATH,
-    )
-    print(f"✅ Diffusion policy saved to: {DIFFUSION_MODEL_PATH}")
+        # 매 epoch마다 덮어쓰기 저장 (epoch 정보 같이 저장)
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "cfg": cfg.__dict__,
+                "epoch": epoch,
+            },
+            DIFFUSION_MODEL_PATH,
+        )
 
+    print(f"✅ Diffusion policy saved to: {DIFFUSION_MODEL_PATH}")
     return model, diffusion, cfg
 
 
@@ -392,27 +444,53 @@ def load_diffusion_policy():
     diffusion = ActionDiffusion(cfg)
     return model, diffusion, cfg
 
+def eval_success(model, n_episodes=50):
+    env = make_env(render_mode=None)
+    success = 0
+    for _ in range(n_episodes):
+        obs, info = env.reset()
+        done = False
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+        # FetchReach는 info["is_success"]가 있음
+        success += info.get("is_success", 0.0)
+    env.close()
+    print("success_rate:", success / n_episodes)
+
+def evaluate_expert():
+    print("🔎 Evaluating PPO Expert policy...")
+    assert os.path.exists(EXPERT_MODEL_PATH + ".zip"), "Expert not trained yet!"
+    env = make_env(render_mode=None)
+    model = PPO.load(EXPERT_MODEL_PATH, env=env)
+    eval_success(model, n_episodes=50)
+    env.close()
 
 def evaluate_diffusion_policy(
     model: DiffusionPolicy,
     diffusion: ActionDiffusion,
     n_episodes: int = 10,
     render: bool = False,
+    save_video: bool = True,
+    video_dir: str = "videos",
 ):
-    env = make_env()
+    env = make_env(render_mode="rgb_array")
     if render:
         # gymnasium robotics render는 backend에 따라 다름. 일단 text info만.
         print("⚠️ Render는 mujoco 설정에 따라 다르게 동작할 수 있습니다.")
 
     returns = []
-
+    os.makedirs(video_dir, exist_ok=True)
+    success = 0
     for ep in range(n_episodes):
         obs, info = env.reset()
         done = False
         ep_return = 0.0
         step = 0
+        frames = []
 
-        while not done and step < 50:
+        while not done and step < 250:
             # obs를 torch tensor로 바꾸고 diffusion으로 action 샘플링
             obs_tensor = torch.tensor(obs, dtype=torch.float32)
             action = diffusion.p_sample_loop(model, obs_tensor, n_samples=1)[0]
@@ -425,31 +503,94 @@ def evaluate_diffusion_policy(
             ep_return += reward
             step += 1
 
+            frame = env.render()
+            frames.append(frame)
+        success += info.get("is_success", 0.0)
+
         returns.append(ep_return)
         print(f"[Diffusion Policy] Episode {ep+1}/{n_episodes} return: {ep_return:.3f}")
 
-    print(f"✅ Avg return over {n_episodes} episodes: {np.mean(returns):.3f}")
+        if save_video and len(frames) > 0:
+            # GIF로 저장 (간단)
+            gif_path = os.path.join(video_dir, f"episode_{ep+1:03d}.gif")
+            imageio.mimsave(gif_path, frames, fps=15)
+            print(f"  🎥 Saved GIF: {gif_path}")
+
+    # print(f"✅ Avg return over {n_episodes} episodes: {np.mean(returns):.3f}")
+    print(f"[Diffusion] success_rate over {n_episodes} episodes: {success / n_episodes:.3f}")
     env.close()
 
+def record_expert_video(
+    n_episodes: int = 5,
+    max_steps: int = 50,
+    video_dir: str = "videos_expert",
+):
+    """
+    PPO Expert 정책이 수행하는 궤적을 GT처럼 GIF로 저장.
+    """
+    assert os.path.exists(EXPERT_MODEL_PATH + ".zip"), "Expert not trained yet!"
+
+    os.makedirs(video_dir, exist_ok=True)
+
+    # 렌더 가능한 env
+    env = make_env(render_mode="rgb_array")
+    model = PPO.load(EXPERT_MODEL_PATH, env=env)
+
+    success = 0
+
+    for ep in range(n_episodes):
+        obs, info = env.reset()
+        done = False
+        frames = []
+        step = 0
+        ep_return = 0.0
+
+        while not done and step < max_steps:
+            # Expert action
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            ep_return += reward
+            step += 1
+
+            # 렌더 프레임 저장
+            frame = env.render()
+            frames.append(frame)
+
+        success += info.get("is_success", 0.0)
+        print(f"[Expert Video] Episode {ep+1}/{n_episodes} return: {ep_return:.3f}, "
+              f"is_success: {info.get('is_success', 0.0)}")
+
+        # GIF 저장
+        if len(frames) > 0:
+            gif_path = os.path.join(video_dir, f"expert_ep_{ep+1:03d}.gif")
+            imageio.mimsave(gif_path, frames, fps=15)
+            print(f"  🎥 Saved Expert GIF: {gif_path}")
+
+    print(f"[Expert] success_rate over {n_episodes} episodes: {success / n_episodes:.3f}")
+    env.close()
 
 # ===========================
 # Main
 # ===========================
 if __name__ == "__main__":
     if TRAIN_EXPERT:
-        train_expert(total_timesteps=300_000)
+        train_expert(total_timesteps=1300_000, tuning=True)
+        evaluate_expert()
+        record_expert_video(n_episodes=5, max_steps=50, video_dir="videos_expert")
 
     if COLLECT_DATA:
-        collect_expert_data(n_episodes=200, max_steps_per_episode=50)
+        collect_expert_data(n_episodes=800, max_steps_per_episode=50)
 
     if TRAIN_DIFFUSION:
         model, diffusion, cfg = train_diffusion_policy(
             batch_size=256,
-            epochs=20,
+            epochs=30,          # 예: 5 epoch씩 추가로 더 돌리기
             lr=1e-4,
+            resume=True,       # 저장된 모델 있으면 이어서
         )
     else:
         model, diffusion, cfg = load_diffusion_policy()
 
     if EVAL_DIFFUSION:
-        evaluate_diffusion_policy(model, diffusion, n_episodes=10, render=False)
+        evaluate_diffusion_policy(model, diffusion, n_episodes=50, render=False, save_video=True)
