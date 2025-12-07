@@ -1,12 +1,12 @@
 """
-FetchReach-v2 + Diffusion Policy (Continuous Action)
+FetchPickAndPlace-v4 + Diffusion Policy (Continuous Action)
 WSL에서도 돌아갈 수 있게 최대한 깔끔하게 작성한 예제.
 
 필요 패키지 (예시):
     pip install gymnasium gymnasium-robotics mujoco stable-baselines3 torch numpy tqdm
 
 주의:
-- FetchReach-v2 환경이 안 뜨면, 설치한 gymnasium-robotics 버전에 맞는 env ID를 확인해야 함.
+FetchPickAndPlace-v4 환경이 안 뜨면, 설치한 gymnasium-robotics 버전에 맞는 env ID를 확인해야 함.
 - Mujoco 라이센스/설치가 필요할 수 있음.
 """
 
@@ -175,7 +175,7 @@ def train_expert(total_timesteps: int = 2_000_000, tuning: bool = True, max_epis
     print(f"✅ Expert model saved to: {EXPERT_MODEL_PATH}.zip")
     env.close()
     eval_env.close()
-    
+
     return model, eval_callback.eval_results
 
 def flatten_obs(obs_dict):

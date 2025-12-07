@@ -32,7 +32,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ===========================
 # 0. 설정
 # ===========================
-ENV_ID = "FetchReach-v4"  # 설치 버전에 따라 v1/v3일 수도 있음
+ENV_ID = "FetchPickAndPlace-v4"  # 설치 버전에 따라 v1/v3일 수도 있음
 EXPERT_MODEL_PATH = "ppo_fetchreach_expert"
 DATASET_PATH = "fetchreach_expert_dataset.npz"
 DIFFUSION_MODEL_PATH = "diffusion_fetchreach_policy.pt"
@@ -43,7 +43,7 @@ COLLECT_DATA = True
 TRAIN_DIFFUSION = True
 EVAL_DIFFUSION = True
 
-print([id for id in gym.envs.registry.keys() if "FetchReach" in id])
+print([id for id in gym.envs.registry.keys() if "Fetch" in id])
 # In MuJoCo 세계: 로봇팔을 MJCF 파일(XML)로 “설계하고” 그걸 엔진이 읽어서 가상의 로봇팔을 만들어줌
 
 def make_env(render_mode): # 로봇 팔을 책상 위에 가져다 놓고 전원을 넣는 것
@@ -154,7 +154,7 @@ def collect_expert_data(
             done = terminated or truncated
             if done:
                 break
-        print(f"[Expert Rollout] Episode {ep+1}/{n_episodes} finished at step {t+1}")
+        # print(f"[Expert Rollout] Episode {ep+1}/{n_episodes} finished at step {t+1}")
 
     observations = np.array(observations, dtype=np.float32)
     actions = np.array(actions, dtype=np.float32)
@@ -575,7 +575,7 @@ def record_expert_video(
 # ===========================
 if __name__ == "__main__":
     if TRAIN_EXPERT:
-        train_expert(total_timesteps=1300_000, tuning=True)
+        train_expert(total_timesteps=2300_000, tuning=True)
         evaluate_expert()
         record_expert_video(n_episodes=5, max_steps=50, video_dir="videos_expert")
 
@@ -585,7 +585,7 @@ if __name__ == "__main__":
     if TRAIN_DIFFUSION:
         model, diffusion, cfg = train_diffusion_policy(
             batch_size=256,
-            epochs=30,          # 예: 5 epoch씩 추가로 더 돌리기
+            epochs=130,          # 예: 5 epoch씩 추가로 더 돌리기
             lr=1e-4,
             resume=True,       # 저장된 모델 있으면 이어서
         )
